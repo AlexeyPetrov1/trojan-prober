@@ -1,34 +1,102 @@
 # trojan-prober
-Trojan-Prober is a prototype implementation of our TrojanProbe that can be used to actively probe and fingerprint Trojan tunnels by their implementation tricks.  
 
-## How to Build:    
-``CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "full" -o trojan-prober ./src``  
+Trojan-Prober actively probes HTTPS/TLS servers and fingerprints Trojan tunnel implementations. The primary workflow is `--probe all` with configurable prediction mode and optional long-running `H1-Incomplete`.
 
-## How to Use:    
-``./trojan-prober --targetServer [IP/DNS] --targetPort [number] --probe [path to json] --log [0|1] ``   
-```
-Options:    
-    --targetServer: Target server IP address or domain name. (string type, required)   
-    --targetPort: Target server port. (string type, required)    
-    --probe: Prefix of the probe JSON file. Use a specific name to run that probe, or "all" to run all probes automatically. (string type, required)    
-    --log: Log level: 0 for all logs, 1 for crucial logs only, Default is 1. (int type, optional)    
+## Build
+
+```bash
+CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "full" -o trojan-prober ./src
 ```
 
-### Example:  
-For demonstration, please refer to the examples given below:
+`H1-Close` and `H1-Incomplete` use libpcap for FIN timing (Linux, CAP_NET_RAW).
 
-#### Example 1: 
-The case of probing trojan-gfw tunnel with a backend caddy HTTPS server. The probe used here is **./src/probe_json/H1-Close.json**. 
+## Usage
 
-![the case of probing trojan-gfw tunnel with a caddy HTTPS server deployed in the backend](./picture/trojangfw+caddy.png)
+Required flags:
 
-#### Example 2: 
-The case of probing a real caddy HTTPS server. The probes used here are all the probes located at **./src/probe_json/**.
+```text
+--targetServer <host>
+--targetPort <port>
+--probe all|<probe-name>
+```
 
-![the case of probing a real caddy HTTPS server](./picture/caddy.png)
+### Main scenario: `--probe all`
 
-## How to Cite:
-#### If you use our tool, please cite the paper as follows:  
+Two independent switches define four common runs:
+
+| prediction-mode | include-h1-incomplete | Probes run |
+|-----------------|----------------------|------------|
+| specific | false | H1-Close, Overbuffer-Incomplete, Short-ALPN-h2, H1-ALPN-h2 |
+| specific | true | above + H1-Incomplete |
+| any-trojan | false | same 4 probes |
+| any-trojan | true | same 5 probes |
+
+Examples:
+
+```bash
+./trojan-prober --targetServer example.com --targetPort 443 --probe all
+./trojan-prober --targetServer example.com --targetPort 443 --probe all --prediction-mode specific --include-h1-incomplete=false
+./trojan-prober --targetServer example.com --targetPort 443 --probe all --prediction-mode any-trojan --include-h1-incomplete=true
+./trojan-prober --targetServer example.com --targetPort 443 --probe all --format json --output result.json
+```
+
+### Prediction modes
+
+- **specific** — `DETECTED` only when a concrete Trojan type has decisive evidence (e.g. `Trojan-Go`, `Trojan-GFW`).
+- **any-trojan** — `DETECTED` when there is decisive evidence for the Trojan family; `detected_type` may be empty if multiple types conflict.
+
+`POSSIBLE` / candidate states are never reported as `DETECTED`.
+
+### JSON output
+
+`--format json` always includes all 5 Trojan candidates and 6 HTTPS server candidates:
+
+```text
+Trojan-GFW, Trojan-Go, Trojan-R, Trojan-RS, Caddy-Trojan
+Nginx, Apache, Caddy, Tomcat, Lighttpd, IIS
+```
+
+### Other flags
+
+```text
+--prediction-mode specific|any-trojan   (default: specific)
+--include-h1-incomplete true|false     (default: false)
+--stop-on-detected true|false          (default: false — full profile in all)
+--probe-timeout 30s
+--fin-timeout 45s
+--overbuffer-timeout 20s
+--incomplete-timeout 605s
+--overbuffer-repeat-num 0              (0 = use JSON value)
+--retries 1
+--delay-between-probes 5s
+--format text|json
+--output result.json
+--log 0|1
+```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | `NOT_DETECTED` |
+| 10 | `DETECTED` |
+| 20 | `INCONCLUSIVE` |
+| 30 | Technical error (no reliable profile) |
+
+### Single probe
+
+```bash
+./trojan-prober --targetServer example.com --targetPort 443 --probe Overbuffer-Incomplete --format json
+```
+
+## Tests
+
+```bash
+go test ./src/...
+```
+
+## Cite
+
 ```
 @article{lv2025trojanprobe,
   title={TrojanProbe: Fingerprinting Trojan tunnel implementations by actively probing crafted HTTP requests},

@@ -2,63 +2,100 @@ package main
 
 import (
 	"crypto/tls"
-	"github.com/liuylv/trojan-prober/src/log"
 	"io"
 	"time"
+
+	"github.com/liuylv/trojan-prober/src/log"
 )
 
-func parseResponseFromClose(tlsConn *tls.Conn, trojanStatus *TrojanStatus) {
-	responseTime, backend := parseResponseTime(tlsConn)
-	responseDuration := responseTime.Sub(startTime)
-
-	// Wait until FIN is captured
-	for finTime.IsZero() {
-		time.Sleep(1 * time.Second)
+func parseResponseFromClose(cfg Config, tlsConn *tls.Conn, finSess *finSession, start time.Time) ProbeResult {
+	pr := ProbeResult{
+		Name:               "H1-Close",
+		Status:             ProbeInconclusive,
+		AffectedCandidates: make(map[string]CandidateState),
+		AffectedHTTPS:      make(map[string]CandidateState),
 	}
 
-	// Calculate the time difference between response and FIN
-	timeDiff := finDuration - responseDuration
-
-	if timeDiff >= 29*time.Second && timeDiff <= 31*time.Second {
-		log.Info("Time difference: %f seconds. Definitely a Trojan-GFW.", timeDiff.Seconds())
-		trojanStatus.TrojanGFW = Definitely
-		return
-	}
-
-	log.Info("Time difference: %f seconds. Definitely not a Trojan-GFW.", timeDiff.Seconds())
-	trojanStatus.TrojanGFW = DefinitelyNot
-	trojanStatus.TrojanGo = Possibly
-	trojanStatus.CaddyTrojan = Possibly
-	trojanStatus.TrojanR = Possibly
-	trojanStatus.TrojanRS = Possibly
-
-	// Update the status of detected backends to Possibly, others to DefinitelyNot
-	serverTypes := map[string]*State{
-		"nginx":     &HTTPServerDetect.Nginx,
-		"apache":    &HTTPServerDetect.Apache,
-		"caddy":     &HTTPServerDetect.Caddy,
-		"tomcat":    &HTTPServerDetect.Tomcat,
-		"lighttpd":  &HTTPServerDetect.Lighttpd,
-		"microsoft": &HTTPServerDetect.IIS,
-	}
-	updateHTTPServerState(backend, serverTypes)
-}
-
-// Parse the response from the server and return the response time and backend type.
-func parseResponseTime(tlsConn *tls.Conn) (time.Time, string) {
+	_ = tlsConn.SetReadDeadline(time.Now().Add(cfg.ProbeTimeout))
 	response := make([]byte, 4096)
 	n, err := tlsConn.Read(response)
-	responseTime := time.Now() // Record response time
+	responseTime := time.Now()
 
 	if err != nil && err != io.EOF {
-		log.Info("Error reading from server:", err)
-		return time.Time{}, ""
+		log.Info("Error reading from server: %v", err)
+		pr.Reason = "Failed to read HTTP response before FIN timing"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
 	}
 
 	responseStr := string(response[:n])
 	backendType := extractBackendType(responseStr)
-	log.Info("Response from server:\n%s", responseStr)
+	if n > 0 {
+		log.Info("Response from server:\n%s", responseStr)
+	}
 	log.Info("Capture response at: %s", responseTime)
 
-	return responseTime, backendType
+	if finSess == nil {
+		pr.Reason = "FIN capture not available"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
+	}
+
+	finSess.mu.Lock()
+	captureStart := finSess.startTime
+	finSess.mu.Unlock()
+
+	if captureStart.IsZero() {
+		pr.Reason = "FIN capture did not start; timing inconclusive"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		markHTTPSFromBackend(pr.AffectedHTTPS, backendType, StatePossible, StateExcluded)
+		return pr
+	}
+
+	responseDuration := responseTime.Sub(captureStart)
+	_, finDuration, captured, finErr := finSess.waitForFIN(cfg.FinTimeout)
+
+	if finErr != nil {
+		pr.Status = ProbeError
+		pr.Error = finErr.Error()
+		pr.Reason = "FIN capture failed"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
+	}
+
+	if !captured {
+		pr.Reason = "FIN not captured within timeout; Trojan-GFW timing inconclusive"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		markHTTPSFromBackend(pr.AffectedHTTPS, backendType, StatePossible, StateExcluded)
+		return pr
+	}
+
+	timeDiff := finDuration - responseDuration
+	if timeDiff < 0 {
+		pr.Reason = "Invalid negative response-to-FIN interval; timing inconclusive"
+		pr.ObservedBehavior = "negative_time_diff"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
+	}
+
+	pr.ObservedBehavior = "time_diff_seconds"
+	log.Info("Time difference: %f seconds", timeDiff.Seconds())
+
+	if timeDiff >= 29*time.Second && timeDiff <= 31*time.Second {
+		setTrojanMap(pr.AffectedCandidates, "Trojan-GFW", StateDefinite)
+		pr.Status = ProbeDetected
+		pr.Decisive = true
+		pr.Reason = "Response-to-FIN interval 29-31s indicates Trojan-GFW"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
+	}
+
+	pr.Reason = "Response-to-FIN interval outside Trojan-GFW window; supporting evidence only"
+	setTrojanMap(pr.AffectedCandidates, "Trojan-Go", StatePossible)
+	setTrojanMap(pr.AffectedCandidates, "Caddy-Trojan", StatePossible)
+	setTrojanMap(pr.AffectedCandidates, "Trojan-R", StatePossible)
+	setTrojanMap(pr.AffectedCandidates, "Trojan-RS", StatePossible)
+	markHTTPSFromBackend(pr.AffectedHTTPS, backendType, StatePossible, StateExcluded)
+	pr.DurationMs = time.Since(start).Milliseconds()
+	return pr
 }

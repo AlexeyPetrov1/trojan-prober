@@ -4,80 +4,82 @@ import (
 	"crypto/tls"
 	"strings"
 	"time"
+
 	"github.com/liuylv/trojan-prober/src/log"
 )
 
-func parseResponseFromShort(tlsConn *tls.Conn, trojanStatus *TrojanStatus) {
-	response := make([]byte, 4096)
+func parseResponseFromShort(cfg Config, tlsConn *tls.Conn, start time.Time) ProbeResult {
+	pr := ProbeResult{
+		Name:               "Short-ALPN-h2",
+		Status:             ProbeInconclusive,
+		Decisive:           false,
+		AffectedCandidates: make(map[string]CandidateState),
+		AffectedHTTPS:      make(map[string]CandidateState),
+	}
 
-	// Set a 150-second timer after TLS handshake
-	timer150 := time.NewTimer(150 * time.Second)
-	defer timer150.Stop()
+	shortTimeout := 150 * time.Second
+	timer := time.NewTimer(shortTimeout)
+	defer timer.Stop()
 
-	// Channel to handle read result
-	readDone := make(chan bool)
-	readError := false
+	readDone := make(chan struct {
+		data  string
+		err   error
+		hasData bool
+	}, 1)
 
-	// Goroutine to read the server response
 	go func() {
+		response := make([]byte, 4096)
 		n, err := tlsConn.Read(response)
-		if err != nil {
-			log.Debug("Error reading from server:%s", err)
-			readDone <- true
-			readError = true
-		}
-		log.Info("Response from server:%s", string(response[:n]))
-		readDone <- true
+		readDone <- struct {
+			data    string
+			err     error
+			hasData bool
+		}{data: string(response[:n]), err: err, hasData: n > 0}
 	}()
 
-	backendType := ""
-
-	// Wait for either the timer or the read operation to complete
 	select {
-	case <-timer150.C:
-		log.Info("No response within 150 seconds. Target is definitely a Trojan, likely Caddy-Trojan or other Trojans with Caddy backend.")
-		isTrojan = Definitely
-		updateState(&trojanStatus.CaddyTrojan, Possibly)
-		updateState(&trojanStatus.TrojanGFW, Possibly)
-		updateState(&trojanStatus.TrojanR, Possibly)
-		updateState(&trojanStatus.TrojanRS, Possibly)
-		return
-	case <-readDone:
-		// Response received before the timer expired
-		responseStr := string(response[:])
-		if !readError { // Read response successfully
+	case <-timer.C:
+		log.Info("No response within 150 seconds (supporting evidence only)")
+		setTrojanMap(pr.AffectedCandidates, "Caddy-Trojan", StatePossible)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-GFW", StatePossible)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-R", StatePossible)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-RS", StatePossible)
+		pr.Reason = "Long silence on Short-ALPN-h2; supporting evidence for Trojan variants with Caddy backend"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
 
-			// Check if the response is not in HTTP/1.x format
-			if !strings.HasPrefix(responseStr, "HTTP/") {
-				for _, state := range []*State{
-					&trojanStatus.TrojanGFW, &trojanStatus.TrojanGo,
-					&trojanStatus.TrojanR, &trojanStatus.TrojanRS, &trojanStatus.CaddyTrojan,
-				} {
-					updateState(state, DefinitelyNot)
-				}
-				log.Info("Response doesn't contain HTTP prefix. Definitely not a Trojan server.")
-				isTrojan = DefinitelyNot
-				return
-			}
-
-			//If the ALPN is h2, the backend is caddy or iis, which supports HTTP/2 by default, and the response is HTTP/1.x, then it must be Trojan
-			backendType = extractBackendType(responseStr)
-			if backendType == "caddy" || backendType == "iis" {
-				isTrojan = Definitely
-			}
+	case res := <-readDone:
+		if res.err != nil {
+			log.Debug("Error reading from server: %v", res.err)
+			pr.Error = res.err.Error()
 		}
-		updateState(&trojanStatus.CaddyTrojan, DefinitelyNot)
-		log.Info("Response received within 150 seconds. Definitely not a Caddy-Trojan.")
-
-		// Update the status of detected backends to Possibly, others to DefinitelyNot
-		serverTypes := map[string]*State{
-			"nginx":     &HTTPServerDetect.Nginx,
-			"apache":    &HTTPServerDetect.Apache,
-			"caddy":     &HTTPServerDetect.Caddy,
-			"tomcat":    &HTTPServerDetect.Tomcat,
-			"lighttpd":  &HTTPServerDetect.Lighttpd,
-			"microsoft": &HTTPServerDetect.IIS,
+		if !res.hasData {
+			pr.Reason = "Empty or error response on Short-ALPN-h2"
+			pr.DurationMs = time.Since(start).Milliseconds()
+			return pr
 		}
-		updateHTTPServerState(backendType, serverTypes)
+
+		log.Info("Response from server:%s", res.data)
+		if !strings.HasPrefix(res.data, "HTTP/") {
+			markAllTrojan(pr.AffectedCandidates, StateExcluded)
+			pr.Status = ProbeExcluded
+			pr.Reason = "Non-HTTP response; excludes Trojan server behavior on this probe"
+			pr.DurationMs = time.Since(start).Milliseconds()
+			return pr
+		}
+
+		setTrojanMap(pr.AffectedCandidates, "Caddy-Trojan", StateExcluded)
+		backendType := extractBackendType(res.data)
+		markHTTPSFromBackend(pr.AffectedHTTPS, backendType, StatePossible, StateExcluded)
+		pr.AlternativeHTTPS = possibleHTTPSFromMap(pr.AffectedHTTPS)
+
+		if backendType == "caddy" || backendType == "iis" {
+			pr.TrojanFamilyHit = true
+			pr.Reason = "HTTP/1.x over h2 with " + backendType + " signature; supporting evidence for Trojan family"
+		} else {
+			pr.Reason = "Response within 150s; ALPN supporting evidence only"
+		}
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
 	}
 }

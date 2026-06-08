@@ -5,78 +5,99 @@ import (
 	"io"
 	"strings"
 	"time"
+
 	"github.com/liuylv/trojan-prober/src/log"
 )
 
-func parseResponseFromOver(tlsConn *tls.Conn, trojanStatus *TrojanStatus) {
-	response := make([]byte, 4096)
+func parseResponseFromOver(cfg Config, tlsConn *tls.Conn, start time.Time) ProbeResult {
+	pr := ProbeResult{
+		Name:               "Overbuffer-Incomplete",
+		Status:             ProbeInconclusive,
+		AffectedCandidates: make(map[string]CandidateState),
+		AffectedHTTPS:      make(map[string]CandidateState),
+	}
 
-	// Set a 20-second timer
-	timer := time.NewTimer(20 * time.Second)
+	response := make([]byte, 4096)
+	timer := time.NewTimer(cfg.OverbufferTimeout)
 	defer timer.Stop()
 
-	readDone := make(chan bool)
+	readDone := make(chan struct {
+		received bool
+		err      error
+	}, 1)
 	exitChan := make(chan struct{})
 
-	// Goroutine to handle reading from the TLS connection
 	go func() {
 		n, err := tlsConn.Read(response)
 		select {
 		case <-exitChan:
-			return // Exit if the exit signal is received
+			return
 		default:
-			if err != nil {
-				if err == io.EOF {
-					log.Info("Error reading from server: %s", err)
-					updateState(&trojanStatus.TrojanRS, Definitely) // Connection closed prematurely, likely Trojan-RS
-				} else {
-					log.Debug("Error reading from server: %s", err)
-				}
-			}
-			readDone <- n > 0 // Signal if data was received
+			readDone <- struct {
+				received bool
+				err      error
+			}{received: n > 0, err: err}
 		}
 	}()
 
-	// Wait for either the timer to expire or data to be read
 	select {
 	case <-timer.C:
-		log.Info("No response received within 20 seconds. Definitely a T-Go.")
-		updateState(&trojanStatus.TrojanGo, Definitely)
-		close(exitChan) // Signal the goroutine to exit
-		return
-	case received := <-readDone:
-		if received {
-			handleResponseFromOver(response, trojanStatus)
+		close(exitChan)
+		log.Info("No response received within %s after successful TLS", cfg.OverbufferTimeout)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-Go", StateDefinite)
+		pr.Status = ProbeDetected
+		pr.Decisive = true
+		pr.Reason = "No HTTP response within timeout after successful TLS connection and request sent"
+		pr.ObservedBehavior = "clean_timeout"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
+
+	case res := <-readDone:
+		if res.err != nil && res.err != io.EOF {
+			log.Debug("Error reading from server: %v", res.err)
+			pr.Status = ProbeError
+			pr.Error = res.err.Error()
+			pr.Reason = "Read error after request; not evidence for Trojan-Go"
+			pr.DurationMs = time.Since(start).Milliseconds()
+			return pr
 		}
+		if res.received {
+			return handleResponseFromOver(response, start)
+		}
+		pr.Reason = "No data received before channel closed"
+		pr.DurationMs = time.Since(start).Milliseconds()
+		return pr
 	}
 }
 
-// Handle and analyze server response
-func handleResponseFromOver(response []byte, trojanStatus *TrojanStatus) {
+func handleResponseFromOver(response []byte, start time.Time) ProbeResult {
+	pr := ProbeResult{
+		Name:               "Overbuffer-Incomplete",
+		Status:             ProbeInconclusive,
+		AffectedCandidates: make(map[string]CandidateState),
+		AffectedHTTPS:      make(map[string]CandidateState),
+	}
 	responseStr := string(response)
+
 	if strings.HasPrefix(responseStr, "HTTP/") {
 		log.Info("Response from server:\n%s", responseStr)
-		log.Info("Received HTTP response. Definitely not a Trojan-Go.")
-		updateState(&trojanStatus.TrojanGo, DefinitelyNot)
-		updateState(&trojanStatus.TrojanGFW, Possibly)
-		updateState(&trojanStatus.CaddyTrojan, Possibly)
-		updateState(&trojanStatus.TrojanR, Possibly)
-		updateState(&trojanStatus.TrojanRS, Possibly)
-
-		// Detect server type and update states accordingly
+		log.Info("Received HTTP response. Excludes Trojan-Go.")
+		setTrojanMap(pr.AffectedCandidates, "Trojan-Go", StateExcluded)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-GFW", StatePossible)
+		setTrojanMap(pr.AffectedCandidates, "Caddy-Trojan", StatePossible)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-R", StatePossible)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-RS", StatePossible)
+		pr.Status = ProbeExcluded
+		pr.Reason = "HTTP response received; excludes Trojan-Go"
 		backendType := extractBackendType(responseStr)
-		serverTypes := map[string]*State{
-			"nginx":     &HTTPServerDetect.Nginx,
-			"apache":    &HTTPServerDetect.Apache,
-			"caddy":     &HTTPServerDetect.Caddy,
-			"tomcat":    &HTTPServerDetect.Tomcat,
-			"lighttpd":  &HTTPServerDetect.Lighttpd,
-			"microsoft": &HTTPServerDetect.IIS,
-		}
-		updateHTTPServerState(backendType, serverTypes)
+		markHTTPSFromBackend(pr.AffectedHTTPS, backendType, StatePossible, StateExcluded)
 	} else {
 		log.Info("Response from server:\n%s", responseStr)
-		log.Info("No HTTP prefix found. Possible Trojan-RS.")
-		updateState(&trojanStatus.TrojanRS, Definitely)
+		setTrojanMap(pr.AffectedCandidates, "Trojan-RS", StateDefinite)
+		pr.Status = ProbeDetected
+		pr.Decisive = true
+		pr.Reason = "Non-HTTP response; indicative of Trojan-RS"
 	}
+	pr.DurationMs = time.Since(start).Milliseconds()
+	return pr
 }
