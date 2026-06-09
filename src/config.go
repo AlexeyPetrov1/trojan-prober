@@ -79,6 +79,9 @@ func parseConfig() Config {
 		fmt.Fprintf(os.Stderr, "invalid --format: %s (use text or json)\n", cfg.OutputFormat)
 		os.Exit(1)
 	}
+	if cfg.OutputFormat == "json" {
+		log.SetDiagnosticOutput(os.Stderr)
+	}
 
 	return cfg
 }

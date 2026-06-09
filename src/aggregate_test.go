@@ -130,3 +130,29 @@ func TestBuildProbeSetFourCombinations(t *testing.T) {
 	}
 	_ = time.Now()
 }
+
+func TestGenericTLSHandshakeErrorDoesNotExcludeCandidates(t *testing.T) {
+	pr := probeResultFromTLSHandshake("H1-Close", errTestString("remote error: tls: internal error"))
+	if pr.Status != ProbeError {
+		t.Fatalf("expected probe ERROR, got %s", pr.Status)
+	}
+	if len(pr.AffectedCandidates) != 0 {
+		t.Fatalf("generic TLS errors should not exclude candidates, got %+v", pr.AffectedCandidates)
+	}
+
+	cfg := Config{PredictionMode: PredictionSpecific, ServerAddr: "h:443"}
+	report := aggregateResults(cfg, []ProbeResult{pr})
+	if !report.TechnicalError {
+		t.Fatal("expected technical_error for generic TLS handshake error")
+	}
+	if report.FinalStatus != StatusInconclusive {
+		t.Fatalf("expected INCONCLUSIVE, got %s", report.FinalStatus)
+	}
+	if report.ExitCode != 30 {
+		t.Fatalf("expected exit 30 for technical error, got %d", report.ExitCode)
+	}
+}
+
+type errTestString string
+
+func (e errTestString) Error() string { return string(e) }

@@ -169,17 +169,17 @@ func probeResultFromTLSHandshake(probe string, err error) ProbeResult {
 		Reason:             "TLS handshake failed",
 		Decisive:           false,
 	}
-	markAllTrojan(pr.AffectedCandidates, StateExcluded)
 
 	msg := err.Error()
 	if strings.Contains(msg, "no application protocol") {
+		markAllTrojan(pr.AffectedCandidates, StateExcluded)
 		setTrojanMap(pr.AffectedCandidates, "Trojan-Go", StatePossible)
 		setHTTPSMap(pr.AffectedHTTPS, "Nginx", StatePossible)
 		setHTTPSMap(pr.AffectedHTTPS, "Lighttpd", StatePossible)
 		pr.Reason = "TLS handshake failed with no application protocol; compatible with Trojan-Go, nginx, or lighttpd"
 		pr.AlternativeHTTPS = []string{"Nginx", "Lighttpd"}
 	} else if strings.Contains(msg, "server selected unadvertised ALPN protocol") {
-		setTrojanMap(pr.AffectedCandidates, "Trojan-Go", StateExcluded)
+		markAllTrojan(pr.AffectedCandidates, StateExcluded)
 		setHTTPSMap(pr.AffectedHTTPS, "Apache", StatePossible)
 		pr.Reason = "TLS handshake: unadvertised ALPN; Apache possible"
 	} else {

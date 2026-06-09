@@ -136,7 +136,7 @@ func allTrojanExcluded(trojan map[string]CandidateEntry) bool {
 }
 
 func exitCodeForReport(report FinalReport) int {
-	if report.TechnicalError && len(report.Probes) == 0 {
+	if report.TechnicalError {
 		return 30
 	}
 	switch report.FinalStatus {
