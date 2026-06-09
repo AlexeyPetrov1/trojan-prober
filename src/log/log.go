@@ -21,6 +21,7 @@ var (
 	infoLogger    *log.Logger
 	debugLogger   *log.Logger
 	errorLogger   *log.Logger
+	diagnosticOut = os.Stdout
 )
 
 func init() {
@@ -33,6 +34,17 @@ func init() {
 // SetLogLevel sets the global log level
 func SetLogLevel(level int) {
 	logLevel = level
+}
+
+// SetDiagnosticOutput sends non-report diagnostics to the supplied writer.
+func SetDiagnosticOutput(out *os.File) {
+	if out == nil {
+		out = os.Stdout
+	}
+	diagnosticOut = out
+	crucialLogger.SetOutput(out)
+	infoLogger.SetOutput(out)
+	debugLogger.SetOutput(out)
 }
 
 func logMessage(level int, logger *log.Logger, prefix, message string, v ...interface{}) {
@@ -80,6 +92,6 @@ func PrintColoredMessage(message string, v ...interface{}) {
 	// Format the message with the provided arguments
 	formattedMessage := fmt.Sprintf(message, v...)
 
-	// Print the colored message to stdout
-	fmt.Printf("%s%s%s\n", yellow, formattedMessage, reset)
+	// Print the colored message to the configured diagnostic stream.
+	fmt.Fprintf(diagnosticOut, "%s%s%s\n", yellow, formattedMessage, reset)
 }
